@@ -202,56 +202,59 @@ router.post('/adjust', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async 
   }
 
   try {
-    const batchList = await db.select().from(batches).where(eq(batches.id, parseInt(batchId, 10)));
-    if (batchList.length === 0) {
-      return res.status(404).json({ success: false, message: 'Batch not found' });
-    }
-
-    const batch = batchList[0];
-    let newAvailable = batch.availableQuantity;
-
-    // Check if adding or subtracting
-    const isDeduction = ['STOCK_OUT', 'DAMAGE', 'EXPIRED', 'ADJUSTMENT_DOWN'].includes(type) || (type === 'ADJUSTMENT' && req.body.direction === 'SUBTRACT');
-    
-    if (isDeduction) {
-      if (batch.availableQuantity < parsedQty) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot deduct ${parsedQty} units. Only ${batch.availableQuantity} available in batch.`,
-        });
+    const result = await db.transaction(async (tx) => {
+      const batchList = await tx.select().from(batches).where(eq(batches.id, parseInt(batchId, 10)));
+      if (batchList.length === 0) {
+        throw new Error('Batch not found');
       }
-      newAvailable -= parsedQty;
-    } else {
-      newAvailable += parsedQty;
-    }
 
-    // If marked EXPIRED, update batch status as well
-    const newStatus = type === 'EXPIRED' ? 'EXPIRED' : batch.status;
+      const batch = batchList[0];
+      let newAvailable = batch.availableQuantity;
 
-    await db
-      .update(batches)
-      .set({
-        availableQuantity: newAvailable,
+      const isDeduction = ['STOCK_OUT', 'DAMAGE', 'EXPIRED', 'ADJUSTMENT_DOWN'].includes(type) || (type === 'ADJUSTMENT' && req.body.direction === 'SUBTRACT');
+      
+      if (isDeduction) {
+        if (batch.availableQuantity < parsedQty) {
+          throw new Error(`Cannot deduct ${parsedQty} units. Only ${batch.availableQuantity} available in batch.`);
+        }
+        newAvailable -= parsedQty;
+      } else {
+        newAvailable += parsedQty;
+      }
+
+      const newStatus = type === 'EXPIRED' ? 'EXPIRED' : batch.status;
+
+      await tx
+        .update(batches)
+        .set({
+          availableQuantity: newAvailable,
+          status: newStatus,
+        })
+        .where(eq(batches.id, batch.id));
+
+      await tx.insert(stockMovements).values({
+        medicineId: batch.medicineId,
+        batchId: batch.id,
+        type,
+        quantity: parsedQty,
+        reason: reason ? reason.trim() : `Manual ${type} adjustment`,
+        reference: `ADJ-${Date.now()}`,
+        userId: req.user?.userId,
+      });
+
+      return {
+        batchId: batch.id,
+        previousQuantity: batch.availableQuantity,
+        newQuantity: newAvailable,
         status: newStatus,
-      })
-      .where(eq(batches.id, batch.id));
-
-    // Record stock movement
-    await db.insert(stockMovements).values({
-      medicineId: batch.medicineId,
-      batchId: batch.id,
-      type,
-      quantity: parsedQty,
-      reason: reason ? reason.trim() : `Manual ${type} adjustment`,
-      reference: `ADJ-${Date.now()}`,
-      userId: req.user?.userId,
+      };
     });
 
     await logAudit({
       userId: req.user?.userId,
       userEmail: req.user?.email,
       action: 'STOCK_ADJUSTMENT',
-      details: `${type} of ${parsedQty} units on batch ${batch.batchNumber}. Reason: ${reason || 'N/A'}`,
+      details: `${type} of ${parsedQty} units on batch ${batchId}. Reason: ${reason || 'N/A'}`,
       ipAddress: req.ip || '127.0.0.1',
       result: 'SUCCESS',
     });
@@ -259,15 +262,10 @@ router.post('/adjust', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async 
     return res.status(200).json({
       success: true,
       message: 'Stock adjusted successfully',
-      data: {
-        batchId: batch.id,
-        previousQuantity: batch.availableQuantity,
-        newQuantity: newAvailable,
-        status: newStatus,
-      },
+      data: result,
     });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: 'Failed to adjust inventory' });
+  } catch (error: any) {
+    return res.status(400).json({ success: false, message: error.message || 'Failed to adjust inventory' });
   }
 });
 

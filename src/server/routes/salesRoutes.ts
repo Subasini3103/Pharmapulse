@@ -13,7 +13,7 @@ import {
 } from '../../db/schema.ts';
 import { requireAuth, requireRole, AuthenticatedRequest } from '../middleware.ts';
 import { logAudit } from '../auth.ts';
-import { eq, desc, asc, and, gte } from 'drizzle-orm';
+import { eq, desc, asc, and, gte, lte, inArray } from 'drizzle-orm';
 
 const router = Router();
 
@@ -27,7 +27,32 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res): Promise<any
       return res.status(403).json({ success: false, message: 'Forbidden: Suppliers cannot access customer sales invoices' });
     }
 
-    let query = db
+    const conditions = [];
+
+    // Object-level check: Customer only sees their own sales
+    if (role === 'CUSTOMER') {
+      if (!req.user?.customerId) {
+        return res.status(200).json({ success: true, data: [] });
+      }
+      conditions.push(eq(sales.customerId, req.user.customerId));
+    } else if (customerId) {
+      const parsedId = parseInt(customerId as string, 10);
+      if (isNaN(parsedId)) return res.status(400).json({ success: false, message: 'Invalid customer ID' });
+      conditions.push(eq(sales.customerId, parsedId));
+    }
+
+    // Date filters (fixing 2.1 in-memory filtering)
+    if (startDate) {
+      const s = new Date(startDate as string);
+      if (!isNaN(s.getTime())) conditions.push(gte(sales.saleDate, s));
+    }
+    if (endDate) {
+      const e = new Date(endDate as string);
+      e.setHours(23, 59, 59, 999);
+      if (!isNaN(e.getTime())) conditions.push(lte(sales.saleDate, e));
+    }
+
+    const list = await db
       .select({
         id: sales.id,
         invoiceNumber: sales.invoiceNumber,
@@ -51,29 +76,8 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res): Promise<any
       .from(sales)
       .leftJoin(customers, eq(sales.customerId, customers.id))
       .leftJoin(pharmacists, eq(sales.pharmacistId, pharmacists.id))
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
       .orderBy(desc(sales.saleDate));
-
-    let list = await query;
-
-    // Object-level check: Customer only sees their own sales
-    if (role === 'CUSTOMER') {
-      if (!req.user?.customerId) {
-        return res.status(200).json({ success: true, data: [] });
-      }
-      list = list.filter((s) => s.customerId === req.user?.customerId);
-    } else if (customerId) {
-      list = list.filter((s) => s.customerId === parseInt(customerId as string, 10));
-    }
-
-    // Date filters
-    if (startDate) {
-      const s = new Date(startDate as string);
-      list = list.filter((item) => new Date(item.saleDate) >= s);
-    }
-    if (endDate) {
-      const e = new Date(endDate as string);
-      list = list.filter((item) => new Date(item.saleDate) <= e);
-    }
 
     return res.status(200).json({ success: true, data: list });
   } catch (error) {
@@ -183,129 +187,122 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
   const discountAmount = Math.max(0, parseFloat(discount || 0));
 
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
+    // FIX 1.2: Timezone safe current date check
     const now = new Date();
+    const todayStr = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().split('T')[0];
 
-    // 1. Prescription validation if any medicine requires it
-    if (prescriptionId) {
-      const rxList = await db.select().from(prescriptions).where(eq(prescriptions.id, parseInt(prescriptionId, 10)));
-      if (rxList.length === 0) {
-        return res.status(400).json({ success: false, message: 'Specified prescription does not exist.' });
-      }
-      const rx = rxList[0];
-      if (rx.status !== 'APPROVED' && rx.status !== 'COMPLETED') {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot sell prescription items with status ${rx.status}. Prescription must be APPROVED.`,
-        });
-      }
-      if (customerId && rx.customerId !== parseInt(customerId, 10)) {
-        return res.status(400).json({
-          success: false,
-          message: 'The prescription provided does not belong to the selected customer.',
-        });
-      }
-    }
-
-    // 2. Prepare items, check stock, apply FEFO
-    interface BatchAllocation {
-      medicineId: number;
-      medicineName: string;
-      batchId: number;
-      batchNumber: string;
-      quantity: number;
-      unitPrice: number;
-      subtotal: number;
-    }
-
-    const allocations: BatchAllocation[] = [];
-    let calculatedSubtotal = 0;
-
+    // Prepare requested totals to fix self-race and N+1 querying (Fix 3 & 1.1)
+    const requestMap = new Map<number, number>();
     for (const item of items) {
       const medId = parseInt(item.medicineId, 10);
       const reqQty = parseInt(item.quantity, 10);
-
       if (isNaN(medId) || isNaN(reqQty) || reqQty <= 0) {
         return res.status(400).json({ success: false, message: 'Invalid medicine or quantity requested.' });
       }
+      requestMap.set(medId, (requestMap.get(medId) || 0) + reqQty);
+    }
+    const medIds = Array.from(requestMap.keys());
 
-      const medList = await db.select().from(medicines).where(eq(medicines.id, medId));
-      if (medList.length === 0) {
-        return res.status(404).json({ success: false, message: `Medicine ID ${medId} not found.` });
+    const invoiceNumber = `INV-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 900 + 100)}`;
+    let finalResult;
+    let finalAllocations: any[] = [];
+    let finalGrandTotal = 0;
+
+    // 4. Database Transaction for safe atomicity (Fix 1.1: TOCTOU Race Condition)
+    await db.transaction(async (tx) => {
+      // 1. Prescription validation inside transaction
+      if (prescriptionId) {
+        const rxList = await tx.select().from(prescriptions).where(eq(prescriptions.id, parseInt(prescriptionId, 10)));
+        if (rxList.length === 0) throw new Error('Specified prescription does not exist.');
+        const rx = rxList[0];
+        if (rx.status !== 'APPROVED' && rx.status !== 'COMPLETED') {
+          throw new Error(`Cannot sell prescription items with status ${rx.status}. Prescription must be APPROVED.`);
+        }
+        if (customerId && rx.customerId !== parseInt(customerId, 10)) {
+          throw new Error('The prescription provided does not belong to the selected customer.');
+        }
       }
 
-      const med = medList[0];
-
-      // Prescription requirement check
-      if (med.prescriptionRequired && !prescriptionId) {
-        return res.status(400).json({
-          success: false,
-          message: `Medicine '${med.name}' requires a doctor's prescription. Please select an approved prescription.`,
-        });
+      // Fetch all required medicines
+      const medList = await tx.select().from(medicines).where(inArray(medicines.id, medIds));
+      if (medList.length !== medIds.length) {
+        throw new Error('One or more requested medicines could not be found.');
       }
 
-      // Fetch all eligible batches for this medicine:
-      // status = 'ACTIVE', expiryDate >= today, availableQuantity > 0
-      // ORDER BY expiryDate ASC (FIRST EXPIRE, FIRST OUT)
-      const eligibleBatches = await db
+      // Fetch all eligible batches for these medicines
+      const eligibleBatches = await tx
         .select()
         .from(batches)
         .where(
           and(
-            eq(batches.medicineId, medId),
+            inArray(batches.medicineId, medIds),
             eq(batches.status, 'ACTIVE'),
-            gte(batches.expiryDate, todayStr)
+            gte(batches.expiryDate, todayStr) // FIX 1.2 strict date comparison
           )
         )
         .orderBy(asc(batches.expiryDate));
 
-      const activeUnexpiredBatches = eligibleBatches.filter(
-        (b) => b.availableQuantity > 0 && new Date(b.expiryDate) >= now
-      );
+      const allocations: any[] = [];
+      let calculatedSubtotal = 0;
 
-      const totalAvailable = activeUnexpiredBatches.reduce((sum, b) => sum + b.availableQuantity, 0);
+      for (const med of medList) {
+        // Fix 2.3: Check inactive medicines
+        if (med.status !== 'ACTIVE') {
+          throw new Error(`Medicine '${med.name}' is inactive and cannot be sold.`);
+        }
 
-      if (totalAvailable < reqQty) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient valid stock for '${med.name}'. Requested: ${reqQty}, Available (unexpired): ${totalAvailable}`,
-        });
+        if (med.prescriptionRequired && !prescriptionId) {
+          throw new Error(`Medicine '${med.name}' requires a doctor's prescription.`);
+        }
+
+        let remainingToFulfill = requestMap.get(med.id) || 0;
+        
+        // Filter batches for this medicine
+        const medBatches = eligibleBatches.filter(b => b.medicineId === med.id && b.availableQuantity > 0);
+        const totalAvailable = medBatches.reduce((sum, b) => sum + b.availableQuantity, 0);
+
+        if (totalAvailable < remainingToFulfill) {
+          throw new Error(`Insufficient valid stock for '${med.name}'. Requested: ${remainingToFulfill}, Available (unexpired): ${totalAvailable}`);
+        }
+
+        const unitPrice = parseFloat(med.unitPrice);
+
+        for (const b of medBatches) {
+          if (remainingToFulfill <= 0) break;
+          const take = Math.min(remainingToFulfill, b.availableQuantity);
+          
+          // Fix 2.2: Floating-Point Accumulation Errors
+          const sub = Math.round(take * unitPrice * 100) / 100;
+
+          allocations.push({
+            medicineId: med.id,
+            medicineName: med.name,
+            batchId: b.id,
+            batchNumber: b.batchNumber,
+            quantity: take,
+            unitPrice,
+            subtotal: sub,
+          });
+
+          calculatedSubtotal += sub;
+          remainingToFulfill -= take;
+          
+          // Deduct from batch in memory for subsequent loop steps
+          b.availableQuantity -= take;
+          
+          // Deduct from DB
+          await tx
+            .update(batches)
+            .set({ availableQuantity: b.availableQuantity })
+            .where(eq(batches.id, b.id));
+        }
       }
 
-      // Apply FEFO across batches
-      let remainingToFulfill = reqQty;
-      const unitPrice = parseFloat(med.unitPrice);
+      calculatedSubtotal = Math.round(calculatedSubtotal * 100) / 100;
+      const taxRate = 0.05;
+      const taxAmount = Math.round(calculatedSubtotal * taxRate * 100) / 100;
+      finalGrandTotal = Math.max(0, calculatedSubtotal + taxAmount - discountAmount);
 
-      for (const b of activeUnexpiredBatches) {
-        if (remainingToFulfill <= 0) break;
-
-        const take = Math.min(remainingToFulfill, b.availableQuantity);
-        const sub = take * unitPrice;
-
-        allocations.push({
-          medicineId: med.id,
-          medicineName: med.name,
-          batchId: b.id,
-          batchNumber: b.batchNumber,
-          quantity: take,
-          unitPrice,
-          subtotal: sub,
-        });
-
-        calculatedSubtotal += sub;
-        remainingToFulfill -= take;
-      }
-    }
-
-    // 3. Tax and Grand Total calculation
-    const taxRate = 0.05; // 5% pharmacy healthcare tax
-    const taxAmount = parseFloat((calculatedSubtotal * taxRate).toFixed(2));
-    const finalGrandTotal = Math.max(0, calculatedSubtotal + taxAmount - discountAmount);
-
-    const invoiceNumber = `INV-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 900 + 100)}`;
-
-    // 4. Database Transaction for safe atomicity
-    const result = await db.transaction(async (tx) => {
       // Create Sale
       const [newSale] = await tx
         .insert(sales)
@@ -325,26 +322,8 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
         })
         .returning();
 
-      // Deduct from batches, insert sale items, and record stock movements
+      // Insert sale items and record stock movements
       for (const alloc of allocations) {
-        // Fetch current batch inside transaction
-        const [currentBatch] = await tx
-          .select()
-          .from(batches)
-          .where(eq(batches.id, alloc.batchId));
-
-        if (!currentBatch || currentBatch.availableQuantity < alloc.quantity) {
-          throw new Error(`Concurrency error: Batch ${alloc.batchNumber} no longer has sufficient quantity.`);
-        }
-
-        const updatedAvail = currentBatch.availableQuantity - alloc.quantity;
-
-        await tx
-          .update(batches)
-          .set({ availableQuantity: updatedAvail })
-          .where(eq(batches.id, alloc.batchId));
-
-        // Insert sale item
         await tx.insert(saleItems).values({
           saleId: newSale.id,
           medicineId: alloc.medicineId,
@@ -354,7 +333,6 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
           subtotal: alloc.subtotal.toFixed(2),
         });
 
-        // Insert stock movement
         await tx.insert(stockMovements).values({
           medicineId: alloc.medicineId,
           batchId: alloc.batchId,
@@ -366,7 +344,6 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
         });
       }
 
-      // If tied to prescription, mark prescription as COMPLETED
       if (prescriptionId) {
         await tx
           .update(prescriptions)
@@ -374,21 +351,21 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
           .where(eq(prescriptions.id, parseInt(prescriptionId, 10)));
       }
 
-      // Create notification
       await tx.insert(notifications).values({
         type: 'SALE_COMPLETED',
         title: `Sale Completed: ${invoiceNumber}`,
         message: `Sale completed for $${finalGrandTotal.toFixed(2)} via ${pMethod}.`,
       });
 
-      return newSale;
+      finalResult = newSale;
+      finalAllocations = allocations;
     });
 
     await logAudit({
       userId: req.user?.userId,
       userEmail: req.user?.email,
       action: 'SALE_CREATION',
-      details: `Created sale ${invoiceNumber} ($${finalGrandTotal.toFixed(2)}) with ${allocations.length} batch allocations (FEFO applied).`,
+      details: `Created sale ${invoiceNumber} ($${finalGrandTotal.toFixed(2)}) with ${finalAllocations.length} batch allocations (FEFO applied).`,
       ipAddress: req.ip || '127.0.0.1',
       result: 'SUCCESS',
     });
@@ -397,13 +374,13 @@ router.post('/', requireAuth, requireRole(['ADMIN', 'PHARMACIST']), async (req: 
       success: true,
       message: 'Sale completed successfully. FEFO applied to inventory batches.',
       data: {
-        sale: result,
-        allocations,
+        sale: finalResult,
+        allocations: finalAllocations,
       },
     });
   } catch (error: any) {
     console.error('Sale transaction error:', error);
-    return res.status(500).json({
+    return res.status(400).json({
       success: false,
       message: error.message || 'Failed to complete sale.',
     });
