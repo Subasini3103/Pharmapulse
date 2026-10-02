@@ -62,9 +62,6 @@ export const LoginPage: React.FC = () => {
           </div>
           <h1 className="text-2xl font-bold tracking-tight">PharmaPulse</h1>
           <p className="text-emerald-100 text-xs mt-1 font-medium">Enterprise Pharmacy Management & POS System</p>
-          <div className="inline-flex items-center gap-1.5 bg-black/20 text-white/90 text-[11px] font-semibold px-2.5 py-0.5 rounded-full mt-3">
-            <Shield className="w-3 h-3" /> Secure PostgreSQL JWT Authentication
-          </div>
         </div>
 
         {/* Form Body */}
