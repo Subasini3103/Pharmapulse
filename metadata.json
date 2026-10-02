@@ -1,0 +1,6 @@
+{
+  "name": "PharmaPulse - Pharmacy Management System",
+  "description": "Enterprise Pharmacy Management System with secure role-based access, inventory FEFO tracking, prescriptions, POS billing, and supplier logistics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
